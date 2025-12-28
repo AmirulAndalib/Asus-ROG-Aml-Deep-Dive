@@ -2,7 +2,7 @@
 
 > **Status update (December 2025):** The original periodic ACPI/DPC stall described in this write-up is **fixed** by an updated ASUS UEFI that rewrites the ACPI `ECLV` routine (removing sleeps/self-rearm behavior) and includes additional ACPI power-management optimizations.
 
-## Fixed in UEFI: What changed
+## What changed
 
 ASUS updated the firmware's ACPI EC/GPE event handling. The key change is the `ECLV` method: it no longer sleeps inside the event-processing loop and no longer self-rearms when it hits an internal "time budget".
 
@@ -514,6 +514,7 @@ Separate from the original DPC stall, other platform stability/power-management 
 > Update 3: Asus sent me beta UEFI, currently testing. (https://x.com/ASUS_ROGNA/status/1971662996339646645/photo/1)
 
 > Update 4: Updated UEFI shipped; `ECLV` rewritten and the periodic ACPI/DPC stall is resolved (see the diff and new LatencyMon screenshots above).
+
 
 
 
