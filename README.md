@@ -1,4 +1,63 @@
-# The ASUS Gaming Laptop ACPI Firmware Bug: A Deep Technical Investigation
+# The ASUS Gaming Laptop ACPI Firmware DPC Stall: A Deep Technical Investigation
+
+> **Status update (December 2025):** The original periodic ACPI/DPC stall described in this write-up is **fixed** by an updated ASUS UEFI that rewrites the ACPI `ECLV` routine (removing sleeps/self-rearm behavior) and includes additional ACPI power-management optimizations.
+
+## Fixed in UEFI: What changed
+
+ASUS updated the firmware's ACPI EC/GPE event handling. The key change is the `ECLV` method: it no longer sleeps inside the event-processing loop and no longer self-rearms when it hits an internal "time budget".
+
+### AML diff (old vs new)
+
+```diff
+ Method (ECLV, 0, NotSerialized)
+ {
+-    // Main loop - continues while events exist OR sleep events are pending
+-    // AND we haven't exceeded our time budget (TI3S < 0x78)
+-    While (((CKEV() != Zero) || (SLEC != Zero)) && (TI3S < 0x78))
++    While ((CKEV () != Zero))
+     {
+         Local1 = One
+-        While (Local1 != Zero)
++        While ((Local1 != Zero))
+         {
+-            Local1 = GEVT()    // Get next event from queue
+-            LEVN (Local1)      // Process the event
+-            TIMC += 0x19       // Increment time counter by 25
+-            
+-            If ((SLEC != Zero) && (Local1 == Zero))
+-            {
+-                If (TIMC == 0x19)
+-                {
+-                    Sleep (0x64)
+-                    TIMC = 0x64
+-                    TI3S += 0x04
+-                }
+-                Else
+-                {
+-                    Sleep (0x19)
+-                    TI3S++
+-                }
+-            }
++            Local1 = GEVT ()
++            LEVN (Local1)
+         }
+     }
+-    
+-    If (TI3S >= 0x78)
+-    {
+-        TI3S = Zero
+-        If (EEV0 == Zero)
+-        {
+-            EEV0 = 0xFF
+-        }
+-    }
+ }
+```
+
+### Updated LatencyMon results (G533ZW, UEFI 327)
+
+<img width="1738" height="636" alt="image" src="https://github.com/user-attachments/assets/767bde14-84c7-41ea-a33f-75a71076cfb9" />
+
 
 ## If You're Here, You Know The Pain
 
@@ -12,7 +71,7 @@ You've likely tried all the conventional fixes:
 - Following convoluted multi-step guides from Reddit threads.
 - Even installing Linux, only to find the problem persists.
 
-If none of that worked, it's because the issue isn't with the operating system or a driver. The problem is far deeper, embedded in the machine's firmware, the UEFI.
+If none of that worked, it's because the issue isn't with the operating system or a driver. The problem was embedded in the machine's firmware (UEFI) - and ASUS has since shipped a UEFI update that fixes the original periodic ACPI/DPC stall mechanism described below.
 
 ## Initial Symptoms and Measurement
 
@@ -107,74 +166,9 @@ Clock-Time,                Event,                    Duration
 134024027623134006,       _SB.PC00.GFX0._PS3 start, 394μs     # Power Off Again!
 ...
 ```
-### Why This Behavior is Fundamentally Incorrect
+### Note on GPU power-method activity
 
-This power cycling is nonsensical because the laptop is configured for a scenario where it is impossible: **The system is in Ultimate Mode (via a MUX switch) with an external display connected.**
-
-In this mode:
-- The discrete NVIDIA GPU (dGPU) is the **only** active graphics processor.
-- The integrated Intel GPU (iGPU) is completely powered down and bypassed.
-- The dGPU is wired directly to the internal and external displays.
-- There is no mechanism for switching between GPUs.
-
-Yet, the firmware ignores MUX state nudging the iGPU path (GFX0) and, worse, engaging dGPU cut/notify logic (PEGP/PEPD) every 30-60 seconds. The dGPU in mux mode isn't just "preferred" - it's the ONLY path to the display. There's no fallback, and no alternative. When the firmware arms DGCE (power off), it's attempting something architecturally impossible.
-
-Most of the time, hardware sanity checks refuse these nonsensical commands, but even failed attempts introduce latency spikes causing audio dropouts, input lag, and accumulating performance degradation. Games freeze mid-session, videos buffer indefinitely, system responsiveness deteriorates until restart.
-
-#### The Catastrophic Edge Case
-
-Sometimes, under specific thermal conditions or race conditions, the power-down actually succeeds. When the firmware manages to power down the GPU that's driving the display, the sequence is predictable and catastrophic:
-
-1. **Firmware OFF attempt** - cuts the dgpu path via PEG1.DGCE
-2. **Hardware complies** - safety checks fail or timing aligns
-3. **Display signal cuts** - monitors go black
-4. **User input triggers wake** - mouse/keyboard activity  
-5. **Windows calls `PowerOnMonitor()`** - attempt display recovery
-6. **NVIDIA driver executes `_PS0`** - GPU power on command
-7. **GPU enters impossible state** - firmware insists OFF, Windows needs ON
-8. **Driver thread blocks indefinitely** - waiting for GPU response
-9. **30-second watchdog expires** - Windows gives up
-10. **System crashes with BSOD**
-
-```
-5: kd> !analyze -v
-*******************************************************************************
-*                                                                             *
-*                        Bugcheck Analysis                                    *
-*                                                                             *
-*******************************************************************************
-
-WIN32K_POWER_WATCHDOG_TIMEOUT (19c)
-Win32k did not turn the monitor on in a timely manner.
-Arguments:
-Arg1: 0000000000000050, Calling monitor driver to power on.
-Arg2: ffff8685b1463080, Pointer to the power request worker thread.
-Arg3: 0000000000000000
-Arg4: 0000000000000000
-...
-STACK_TEXT:  
-fffff685`3a767130 fffff800`94767be0     : 00000000`00000047 00000000`00000000 00000000`00000000 00000000`00000000 : nt!KiSwapContext+0x76
-fffff685`3a767270 fffff800`94726051     : ffff8685`b1463080 00000027`00008b94 fffff685`3a767458 fffff800`00000000 : nt!KiSwapThread+0x6a0
-fffff685`3a767340 fffff800`94724ed3     : fffff685`00000000 00000000`00000043 00000000`00000002 0000008a`fbf50968 : nt!KiCommitThreadWait+0x271
-fffff685`3a7673e0 fffff800`9471baf2     : fffff685`3a7675d0 02000000`0000001b 00000000`00000000 fffff800`94724500 : nt!KeWaitForSingleObject+0x773
-fffff685`3a7674d0 fffff800`9471b7d5     : ffff8685`9cbec810 fffff685`3a7675b8 00000000`00010224 fffff800`00000003 : nt!ExpWaitForFastResource+0x92
-fffff685`3a767580 fffff800`9471b49d     : 00000000`00000000 ffff8685`9cbec850 ffff8685`b1463080 00000000`00000000 : nt!ExpAcquireFastResourceExclusiveSlow+0x1e5
-fffff685`3a767630 fffff800`28faca9b     : fffff800`262ee9c8 00000000`00000003 ffff8685`9cbec810 02000000`00000065 : nt!ExAcquireFastResourceExclusive+0x1bd
-fffff685`3a767690 fffff800`28facbe5     : ffff8685`b31de000 00000000`00000000 ffffd31d`9a05244f 00000000`00000000 : win32kbase!<lambda_63b61c2369133a205197eda5bd671ee7>::<lambda_invoker_cdecl>+0x2b
-fffff685`3a7676c0 fffff800`28e5f864     : ffffad0c`94d10878 fffff685`3a767769 ffffad0c`94d10830 ffff8685`b31de000 : win32kbase!UserCritInternal::`anonymous namespace'::EnterCritInternalEx+0x4d
-fffff685`3a7676f0 fffff800`28e5f4ef     : 00000000`00000000 00000000`00000000 fffff800`262ee9c8 00000000`00000000 : win32kbase!DrvSetWddmDeviceMonitorPowerState+0x354
-fffff685`3a7677d0 fffff800`28e2abab     : ffff8685`b31de000 00000000`00000000 ffff8685`b31de000 00000000`00000000 : win32kbase!DrvSetMonitorPowerState+0x2f
-fffff685`3a767800 fffff800`28ef22fa     : 00000000`00000000 fffff685`3a7678d9 00000000`00000001 00000000`00000001 : win32kbase!PowerOnMonitor+0x19b
-fffff685`3a767870 fffff800`28ef13dd     : ffff8685`94a40700 ffff8685`a2eb31d0 00000000`00000001 00000000`00000020 : win32kbase!xxxUserPowerEventCalloutWorker+0xaaa
-fffff685`3a767940 fffff800`4bab21c2     : ffff8685`b1463080 fffff685`3a767aa0 00000000`00000000 00000000`00000020 : win32kbase!xxxUserPowerCalloutWorker+0x13d
-fffff685`3a7679c0 fffff800`26217f3a     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : win32kfull!NtUserUserPowerCalloutWorker+0x22
-fffff685`3a7679f0 fffff800`94ab8d55     : 00000000`000005bc 00000000`00000104 ffff8685`b1463080 00000000`00000000 : win32k!NtUserUserPowerCalloutWorker+0x2e
-fffff685`3a767a20 00007ff8`ee71ca24     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : nt!KiSystemServiceCopyEnd+0x25
-000000cc`d11ffbc8 00000000`00000000     : 00000000`00000000 00000000`00000000 00000000`00000000 00000000`00000000 : 0x00007ff8`ee71ca24
-
-...
-```
-The crash dump confirms the thread is stuck in `win32kbase!DrvSetWddmDeviceMonitorPowerState`, waiting for the NVIDIA driver to respond. It can't because it's caught between a confused power state, windows wanting to turn on the GPU while the firmware is arming the GPU cut off.
+The trace also shows periodic GPU-related ACPI method activity (for example `_PS0`, `_PS3`, and `_DOS`) correlated with `_GPE._L02`. The exact platform intent and correctness of these GPU transitions varies by model, configuration, and UEFI version, so this write-up no longer treats this as a settled root cause. The focus below is the measured ACPI stall mechanism and its firmware fix.
 
 ### Understanding General Purpose Events
 
@@ -248,9 +242,9 @@ Scope (_GPE)
 ```
 This code is simple: when the `_L02` interrupt occurs, it calls a single method, `ECLV`. The "L" prefix in `_L02` signifies that this is a **level-triggered** interrupt, meaning it will continue to fire as long as the underlying hardware condition is active. This is a critical detail.
 
-### The Catastrophic `ECLV` Implementation
+### The pre-fix `ECLV` implementation (historical)
 
-Following the call to `ECLV()`, we uncover a deeply flawed implementation that is the direct cause of the system-wide stuttering.
+In older UEFI versions, `ECLV()` looked like this. This behavior is sufficient to explain the periodic stutters/latency spikes observed in ETW and LatencyMon. Newer UEFI builds replace it (see the diff at the top of this document).
 
 ```asl
 Method (ECLV, 0, NotSerialized)  // Starting at line 099244
@@ -297,11 +291,11 @@ Method (ECLV, 0, NotSerialized)  // Starting at line 099244
 }
 ```
 
-### Breaking Down this monstrosity
+### Breaking down the pre-fix behavior
 
 This short block of code violates several fundamental principles of firmware and kernel programming.
 
-**Wtf 1: Sleeping in an Interrupt Context**
+**Issue 1: Sleeping in an interrupt-driven path**
 ```asl
 Sleep (0x64)    // 100ms sleep
 Sleep (0x19)    // 25ms sleep
@@ -313,10 +307,10 @@ An interrupt handler runs at a very high priority to service hardware requests q
 
 > Clarification: These Sleep() calls live in the ACPI GPE handling path for the GPE L02, these calls get executed at PASSIVE_LEVEL after the SCI/GPE is acknowledged so it's not a raw ISR (because i don't think windows will even allow that) but analyzing this further while the control method runs the GPE stays masked  and the ACPI/EC work is serialized. With the Sleep() calls inside that path and the self rearm it seems to have the effect of making ACPI.sys get tied up in long periodic bursts (often on CPU 0) which still have the same effect on the system.
 
-**Wtf 2: Time-Sliced Interrupt Processing**
+**Issue 2: Time-sliced event processing**
 The entire loop is designed to run for an extended period, processing events in batches. It's effectively a poorly designed task scheduler running inside an interrupt handler, capable of holding a CPU core hostage for potentially seconds at a time.
 
-**Wtf 3: Self-Rearming Interrupt**
+**Issue 3: Self-rearming behavior**
 ```asl
 If (EEV0 == Zero)
 {
@@ -428,129 +422,7 @@ Method (NOD2, 1, Serialized)
     }
 }
 ```
-These notifications (`0xD1`, `0xD2`, etc.) are hardware-specific signals that tell the NVIDIA driver to re-evaluate its power state, which prompts driver power-state re-evaluation; in traces this surfaces as iGPU GFX0._PSx/_DOS toggles plus dGPU state changes via PEPD._DSM/DGCE.
-
-
-## The Mux Mode Confusion: A Firmware with a Split Personality
-
-Here's where a simple but catastrophic oversight in the firmware's logic causes system-wide failure. High-end ASUS gaming laptops feature a MUX (Multiplexer) switch, a piece of hardware that lets the user choose between two distinct graphics modes:
-
-1.  **Optimus Mode:** The power-saving default. The integrated Intel GPU (iGPU) is physically connected to the display. The powerful NVIDIA GPU (dGPU) only renders demanding applications when needed, passing finished frames to the iGPU to be drawn on screen.
-2.  **Ultimate/Mux Mode:** The high-performance mode. The MUX switch physically rewires the display connections, bypassing the iGPU entirely and wiring the NVIDIA dGPU directly to the screen. In this mode, the dGPU is not optional; it is the **only** graphics processor capable of outputting an image.
-
-Any firmware managing this hardware **must** be aware of which mode the system is in. Sending a command intended for one GPU to the other is futile and, in some cases, dangerous. Deep within the ACPI code, a hardware status flag named `HGMD` is used to track this state. To understand the flaw, we first need to decipher what `HGMD` means, and the firmware itself gives us the key.
-
-#### **Decoding the Firmware's Logic with the Brightness Method**
-
-For screen brightness to work, the command must be sent to the GPU that is physically controlling the display backlight. A command sent to the wrong GPU will simply do nothing. Therefore, the brightness control method (`BRTN`) *must* be aware of the MUX switch state to function at all. It is the firmware's own Rosetta Stone.
-
-```asl
-// Brightness control - CORRECTLY checks for mux mode
-Method (BRTN, 1, Serialized)  // Line 034003
-{
-    If (((DIDX & 0x0F0F) == 0x0400))
-    {
-        If (HGMD == 0x03)  // 0x03 = Ultimate/Mux mode
-        {
-            // In mux mode, notify discrete GPU
-            Notify (\_SB.PC00.PEG1.PEGP.EDP1, Arg0)
-        }
-        Else
-        {
-            // In Optimus, notify integrated GPU
-            Notify (\_SB.PC00.GFX0.DD1F, Arg0)
-        }
-    }
-}
-```
-
-The logic here is flawless and revealing. The code uses the `HGMD` flag to make a binary decision. If `HGMD` is `0x03`, it sends the command to the NVIDIA GPU. If not, it sends it to the Intel GPU. The firmware itself, through this correct implementation, provides the undeniable definition: **`HGMD == 0x03` means the system is in Ultimate/Mux Mode.**
-
-#### **The Logical Contradiction: Unconditional Power Cycling in a Conditional Hardware State**
-
-This perfect, platform-aware logic is completely abandoned in the critical code paths responsible for power management. The `LGPA` method, which is called by the stutter-inducing interrupt, dispatches power-related commands to the GPU *without ever checking the MUX mode*.
-
-```asl
-// GPU power notification - NO MUX CHECK!
-Case (0x18)
-{
-    // This SHOULD have: If (HGMD != 0x03)
-    // But it doesn't, so it runs even in mux mode
-    If (M6EF == One)
-    {
-        Local0 = 0xD2
-    }
-    Else
-    {
-        Local0 = 0xD1
-    }
-    NOD2 (Local0)  // Notifies GPU regardless of mode
-}
-```
-
-### Another Path to the Same Problem: The Platform Power Management DSM
-
-This is not a single typo. A second, parallel power management system in the firmware exhibits the exact same flaw. The Platform Extension Plug-in Device (`PEPD`) is used by Windows to manage system-wide power states, such as turning off displays during modern standby.
-
-```asl
-Device (PEPD)  // Line 071206
-{
-    Name (_HID, "INT33A1")  // Intel Power Engine Plugin
-    
-    Method (_DSM, 4, Serialized)  // Device Specific Method
-    {
-        // ... lots of setup code ...
-        
-        // Arg2 == 0x05: "All displays have been turned off"
-        If ((Arg2 == 0x05))
-        {
-            // Prepare for aggressive power saving
-            If (CondRefOf (\_SB.PC00.PEG1.DHDW))
-            {
-                ^^PC00.PEG1.DHDW ()         // GPU pre-shutdown work
-                ^^PC00.PEG1.DGCE = One      // Set "GPU Cut Enable" flag
-            }
-            
-            If (S0ID == One)  // If system supports S0 idle
-            {
-                GUAM (One)    // Enter low power mode
-            }
-            
-            ^^PC00.DPOF = One  // Display power off flag
-            
-            // Tell USB controller about display state
-            If (CondRefOf (\_SB.PC00.XHCI.PSLI))
-            {
-                ^^PC00.XHCI.PSLI (0x05)
-            }
-        }
-        
-        // Arg2 == 0x06: "A display has been turned on"
-        If ((Arg2 == 0x06))
-        {
-            // Wake everything back up
-            If (CondRefOf (\_SB.PC00.PEG1.DGCE))
-            {
-                ^^PC00.PEG1.DGCE = Zero     // Clear "GPU Cut Enable"
-            }
-            
-            If (S0ID == One)
-            {
-                GUAM (Zero)   // Exit low power mode
-            }
-            
-            ^^PC00.DPOF = Zero  // Display power on flag
-            
-            If (CondRefOf (\_SB.PC00.XHCI.PSLI))
-            {
-                ^^PC00.XHCI.PSLI (0x06)
-            }
-        }
-    }
-}
-```
-
-Once again, the firmware prepares to cut power to the discrete GPU without first checking if it's the only GPU driving the displays. This demonstrates that the Mux Mode Confusion is a systemic design flaw. The firmware is internally inconsistent, leading it to issue self-destructive commands that try to cripple the system.
+These notifications (`0xD1`, `0xD2`, etc.) are hardware-specific signals that tell the NVIDIA driver to re-evaluate its power state. In traces this can surface as GPU-related ACPI method activity (for example `_PSx` / `_DOS`) near the same periodic events.
 
 ## Cross-System Analysis
 
@@ -575,14 +447,14 @@ The firmware acts as the hardware abstraction layer between Windows and the phys
 
 Microsoft's [Hardware Lab Kit GlitchFree test](https://learn.microsoft.com/windows-hardware/test/hlk/testref/f0ed5aa8-ef49-4fc9-99b6-753c857e4e2d) validates this hardware-software contract by measuring audio/video glitches during HD playback. It fails systems with driver stalls exceeding a few milliseconds because such delays break real-time guarantees needed for smooth media playback.
 
-These ASUS systems violate those constraints. The firmware holds GPE._L02 masked for 13ms while sleeping in ECLV, serializing all ACPI/EC operations behind that delay. It polls battery state when it should use event-driven notifications. It attempts GPU power transitions without checking platform configuration (HGMD). All these problems result in powerful hardware crippled by firmware that doesn't understand its own execution context.
+These ASUS systems violate those constraints. The firmware holds GPE._L02 masked for 13ms while sleeping in ECLV, serializing all ACPI/EC operations behind that delay. It polls battery state when it should use event-driven notifications. The net result is severe periodic latency spikes on otherwise high-end hardware.
 
 ### The Universal Pattern
 
 Despite being different models, all affected systems exhibit the same core flaws:
 1.  `_GPE._L02` handlers take milliseconds to execute instead of microseconds.
 2.  The GPEs trigger unnecessary battery polling.
-3.  The firmware attempts to power cycle the GPU while in a fixed MUX mode.
+3.  Some platforms show GPU-related method activity correlated with the same periodic events.
 4.  The entire process is driven by a periodic, timer-like trigger.
 
 ## Summarizing the Findings
@@ -597,7 +469,7 @@ On windows, the LXX / EXX run at PASSIVE_LEVEL via ACPI.sys but while a GPE cont
 The firmware artificially re-arms the interrupt, creating an endless loop of GPEs instead of clearing the source and waiting for the next legitimate hardware event. This transforms a hardware notification system into a disruptive, periodic timer.
 
 ### Root Cause 3: Lack of Platform Awareness
-The code that sends GPU power notifications does not check if the system is in MUX mode, a critical state check that is correctly performed in other parts of the firmware. This demonstrates inconsistency and a lack of quality control.
+Some of the GPU-related ACPI activity observed alongside `_GPE._L02` remains under investigation and is not treated as a settled root cause in this write-up.
 
 ## Timeline of User Reports
 
@@ -625,25 +497,24 @@ Even the latest generations aren't immune:
 
 ## Conclusion
 
-The evidence is undeniable:
--   **Measured Proof:** GPE handlers are measured blocking a CPU core for over 13 milliseconds.
--   **Code Proof:** The decompiled firmware explicitly contains `Sleep()` calls within an interrupt handler.
--   **Logical Proof:** The code lacks critical checks for the laptop's hardware state (MUX mode).
--   **Systemic Proof:** The issue is reproducible across different models and UEFI versions.
+### Status: fixed (UEFI update)
 
-> Matthew Garrett had commented on this analysis, suggesting the system-wide freezes are likely caused by the firmware entering System Management Mode (SMM), highly recommend also checking this out for additional context and understanding: https://news.ycombinator.com/item?id=45282069
+The periodic ACPI/DPC stall mechanism in this write-up was caused by firmware behavior inside `ECLV` (sleeping/polling and self-rearming in the EC/GPE event path). ASUS has since shipped a UEFI update that rewrites `ECLV` to process queued events without sleeping and without artificial self-rearm, and also optimizes additional ACPI power-management methods.
 
-Until a fix is implemented, millions of buyers of Asus laptops from approx. 2021 to present day are facing stutters on the simplest of tasks, such as watching YouTube, for the simple mistake of using a sleep call inside of an inefficient interrupt handler and not checking the GPU environment properly.
+If you were here for the original "ACPI.sys latency spikes every ~30–60 seconds" symptom: update to the latest UEFI for your model and then capture fresh LatencyMon screenshots in the section above.
 
-The code is there. The traces prove it. ASUS must fix its firmware.
+### Ongoing investigation
+
+Separate from the original DPC stall, other platform stability/power-management issues are still being investigated (including PCIe power-management configuration problems such as LTR L1.2 threshold mismatches). That work is outside the scope of this specific "DPC stall" write-up.
 
 > Update 1: ASUS has officially put out a statement: https://x.com/asus_rogna/status/1968404596658983013?s=46
 
 > Update 2: Reply from ASUS RD received; repro info sent over
 
-> Update 3: Asus sent me beta BIOS, currently testing. (https://x.com/ASUS_ROGNA/status/1971662996339646645/photo/1)
+> Update 3: Asus sent me beta UEFI, currently testing. (https://x.com/ASUS_ROGNA/status/1971662996339646645/photo/1)
 
-*Investigation conducted using the Windows Performance Toolkit, ACPI table extraction tools, and Intel ACPI Component Architecture utilities. All code excerpts are from official ASUS firmware. Traces were captured on multiple affected systems, all showing consistent behavior. I used an LLM for wording. The research, traces, and AML decomp are mine. Every claim is verified and reproducible if you follow the steps in the article; logs and commands are in the repo. If you think something's wrong, cite the exact timestamp/method/line. "AI wrote it" is not an argument.*
+> Update 4: Updated UEFI shipped; `ECLV` rewritten and the periodic ACPI/DPC stall is resolved (see the diff and new LatencyMon screenshots above).
+
 
 
 
